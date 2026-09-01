@@ -1,0 +1,3 @@
+numpy>=1.26,<3
+sherpa-onnx==1.13.6
+sounddevice>=0.4.6,<1
