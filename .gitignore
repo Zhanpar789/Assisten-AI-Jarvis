@@ -15,13 +15,18 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 
-models/*.tar.bz2
-models/sherpa-onnx-*/
-models/silero_vad.int8.onnx
+# Local speech/TTS models are large runtime dependencies, not source assets.
+models/
 
 whisper.cpp/
 
 .DS_Store
+
+# Local configuration and generated audio.
+.env
+.env.*
+!.env.example
+*.mp3
 
 .vscode/
 .idea/

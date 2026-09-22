@@ -5,14 +5,21 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import math
+import os
 import queue
 import random
 import re
+import select
 import signal
 import subprocess
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -49,12 +56,67 @@ YOUTUBE_URL = "https://www.youtube.com/"
 
 # Local speech configuration.
 DEBUG = True
-VOICE_NAME = "Daniel"
 VOICE_CONFIRMATIONS = True
 SPEAKER_SETTLING_SECONDS = 0.35
-SAY_TIMEOUT_SECONDS = 30.0
+TTS_TIMEOUT_SECONDS = 30.0
+KOKORO_PYTHON = Path("/Users/haimac/kokoro-mlx-venv/bin/python")
+KOKORO_MODEL_DIRECTORY = (
+    Path(__file__).resolve().parent / "models" / "kokoro-82m-bf16"
+)
+KOKORO_VOICE = "bm_george"
+KOKORO_TTS_HELPER = Path(__file__).resolve().parent / "kokoro_tts_worker.py"
+OLLAMA_TIMEOUT_SECONDS = 20.0
+OLLAMA_MAX_OUTPUT_CHARS = 2_000
+OLLAMA_MAX_INPUT_CHARS = 4_000
+ELEVENLABS_MAX_AUDIO_BYTES = 20 * 1024 * 1024
 APP_COMMAND_TIMEOUT_SECONDS = 10.0
 COMMAND_ASR = "whisper"
+ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat"
+OLLAMA_SYSTEM_PROMPT = (
+    "You are Jarvis. Answer briefly, naturally, and politely. "
+    "Output only the text answer to be spoken. "
+    "You do not control applications, VPN, filesystems, shells, or systems. "
+    "Do not claim that you performed an action. "
+    "Never output commands, tool calls, or tool-call-like formats."
+)
+
+
+def load_env_file() -> dict[str, str]:
+    values: dict[str, str] = {}
+    env_path = Path(__file__).resolve().parent / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+ENV_VALUES = load_env_file()
+ELEVENLABS_API_KEY = os.environ.get(
+    "ELEVENLABS_API_KEY", ENV_VALUES.get("ELEVENLABS_API_KEY", "")
+)
+ELEVENLABS_VOICE_ID = os.environ.get(
+    "ELEVENLABS_VOICE_ID", ENV_VALUES.get("ELEVENLABS_VOICE_ID", "")
+)
+ELEVENLABS_MODEL_ID = os.environ.get(
+    "ELEVENLABS_MODEL_ID",
+    ENV_VALUES.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+)
+OLLAMA_MODEL = os.environ.get(
+    "OLLAMA_MODEL", ENV_VALUES.get("OLLAMA_MODEL", "llama3.2:3b")
+)
 MODEL_DIRECTORY = (
     Path(__file__).resolve().parent
     / "models"
@@ -65,9 +127,16 @@ MODEL_ENCODER = MODEL_DIRECTORY / "encoder.int8.onnx"
 MODEL_DECODER = MODEL_DIRECTORY / "decoder.int8.onnx"
 MODEL_JOINER = MODEL_DIRECTORY / "joiner.int8.onnx"
 WHISPER_DIRECTORY = Path(__file__).resolve().parent / "whisper.cpp"
-WHISPER_MODEL = WHISPER_DIRECTORY / "models" / "ggml-large-v3-turbo-q5_0.bin"
-WHISPER_MODEL_SIZE = 574_041_195
-WHISPER_MODEL_SHA1 = "e050f7970618a659205450ad97eb95a18d69c9ee"
+WHISPER_Q5_MODEL = (
+    WHISPER_DIRECTORY / "models" / "ggml-large-v3-turbo-q5_0.bin"
+)
+WHISPER_Q5_MODEL_SIZE = 574_041_195
+WHISPER_Q5_MODEL_SHA1 = "e050f7970618a659205450ad97eb95a18d69c9ee"
+WHISPER_MODEL = (
+    WHISPER_DIRECTORY / "models" / "ggml-large-v3-turbo-q8_0.bin"
+)
+WHISPER_MODEL_SIZE = 874_188_075
+WHISPER_MODEL_SHA1 = "01bf15bedffe9f39d65c1b6ff9b687ea91f59e0e"
 WHISPER_BRIDGE = (
     Path(__file__).resolve().parent
     / "native"
@@ -80,10 +149,10 @@ WHISPER_OUTPUT_BYTES = 4_096
 VAD_MODEL = Path(__file__).resolve().parent / "models" / "silero_vad.int8.onnx"
 VAD_MODEL_SIZE = 212_860
 VAD_MODEL_SHA256 = "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20"
-VAD_THRESHOLD = 0.5
-VAD_MIN_SPEECH_SECONDS = 0.15
-VAD_MIN_SILENCE_SECONDS = 0.45
-VAD_PRE_ROLL_SECONDS = 0.25
+VAD_THRESHOLD = 0.55
+VAD_MIN_SPEECH_SECONDS = 0.25
+VAD_MIN_SILENCE_SECONDS = 0.55
+VAD_PRE_ROLL_SECONDS = 0.40
 VAD_MAX_SPEECH_SECONDS = 15.0
 KWS_STANDALONE_TIMEOUT_SECONDS = 1.5
 KWS_DIRECTORY = (
@@ -103,8 +172,20 @@ KWS_JOINER = (
 )
 KWS_KEYWORDS = KWS_DIRECTORY / "keywords_jarvis.txt"
 KWS_KEYWORDS_SCORE = 1.0
-KWS_KEYWORDS_THRESHOLD = 0.25
+KWS_KEYWORDS_THRESHOLD = 0.30
 KWS_NUM_THREADS = 1
+
+OPENWAKEWORD_SAMPLE_RATE = 16_000
+OPENWAKEWORD_FRAME_SAMPLES = 1_280
+OPENWAKEWORD_AUDIO_QUEUE_BLOCKS = 32
+OPENWAKEWORD_MODEL_PATH = os.environ.get(
+    "OPENWAKEWORD_MODEL_PATH",
+    ENV_VALUES.get("OPENWAKEWORD_MODEL_PATH", ""),
+).strip()
+OPENWAKEWORD_THRESHOLD_TEXT = os.environ.get(
+    "OPENWAKEWORD_THRESHOLD",
+    ENV_VALUES.get("OPENWAKEWORD_THRESHOLD", "0.5"),
+).strip()
 
 SHORT_ACKNOWLEDGEMENTS = [
     "Okay, Sir.",
@@ -277,6 +358,7 @@ INTENT_SPECIAL_SLEEP = "special_sleep"
 INTENT_DIRECT_CALL = "direct_call"
 INTENT_WORK_MODE = "work_mode"
 INTENT_BREAK_TIME = "break_time"
+INTENT_CONVERSATION = "conversation"
 DIRECT_CALL_WAKE_NAMES = {
     "jarvis",
     "jarvish",
@@ -531,11 +613,134 @@ def stop_stay_awake(
     return None, process.poll() is not None
 
 
+class KokoroTTSClient:
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[str] | None = subprocess.Popen(
+            [
+                str(KOKORO_PYTHON),
+                str(KOKORO_TTS_HELPER),
+                str(KOKORO_MODEL_DIRECTORY),
+                KOKORO_VOICE,
+                str(TTS_TIMEOUT_SECONDS),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            response = self._read_response(TTS_TIMEOUT_SECONDS)
+            if response.get("ready") is not True:
+                raise RuntimeError("Kokoro TTS helper failed to initialize")
+        except BaseException:
+            self.close()
+            raise
+
+    def _read_response(self, timeout: float) -> dict[str, object]:
+        process = self.process
+        if process is None or process.stdout is None:
+            raise RuntimeError("Kokoro TTS helper has no stdout")
+        ready, _, _ = select.select([process.stdout], [], [], timeout)
+        if not ready:
+            raise TimeoutError("Kokoro TTS helper response timed out")
+        line = process.stdout.readline()
+        if not line:
+            raise RuntimeError("Kokoro TTS helper exited unexpectedly")
+        response = json.loads(line)
+        if not isinstance(response, dict):
+            raise RuntimeError("Invalid Kokoro TTS helper response")
+        return response
+
+    def speak(self, text: str) -> None:
+        process = self.process
+        if process is None or process.poll() is not None or process.stdin is None:
+            raise RuntimeError("Kokoro TTS helper is not running")
+        try:
+            process.stdin.write(json.dumps({"text": text}) + "\n")
+            process.stdin.flush()
+            response = self._read_response(TTS_TIMEOUT_SECONDS)
+        except (BrokenPipeError, OSError, TimeoutError, ValueError) as error:
+            self.close()
+            raise RuntimeError("Kokoro TTS request failed") from error
+        if response.get("ok") is not True:
+            self.close()
+            raise RuntimeError("Kokoro TTS synthesis or playback failed")
+
+    def close(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        try:
+            if process.stdin is not None and process.poll() is None:
+                process.stdin.write(json.dumps({"shutdown": True}) + "\n")
+                process.stdin.flush()
+                self._read_response(3.0)
+        except (BrokenPipeError, OSError, RuntimeError, TimeoutError, ValueError):
+            pass
+        finally:
+            self.process = None
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                process.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+_kokoro_tts_client: KokoroTTSClient | None = None
+
+
 def say(text: str) -> None:
-    run_command(
-        ["say", "-v", VOICE_NAME, text],
-        SAY_TIMEOUT_SECONDS,
+    if _kokoro_tts_client is None:
+        raise RuntimeError("Kokoro TTS client is not initialized")
+    _kokoro_tts_client.speak(text)
+
+
+def generate_conversation_response(text: str) -> str | None:
+    request = urllib.request.Request(
+        OLLAMA_ENDPOINT,
+        data=json.dumps(
+            {
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": text[:OLLAMA_MAX_INPUT_CHARS],
+                    },
+                ],
+                "stream": False,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=OLLAMA_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read(2 * 1024 * 1024))
+        message = payload.get("message")
+        answer = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(answer, str):
+            return None
+        answer = answer.strip()[:OLLAMA_MAX_OUTPUT_CHARS]
+        return answer or None
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        urllib.error.URLError,
+    ):
+        debug("Ollama conversation request failed or is unavailable")
+        return None
 
 
 def is_app_running(process_name: str) -> bool:
@@ -755,7 +960,7 @@ def command_intent_with_kws_context(text: str) -> str | None:
         words = words[1:]
     elif (
         len(words) >= 2
-        and words[0] in {"hey", "hello"}
+        and words[0] in {"hey", "hello", "okay", "ok"}
         and words[1] in DIRECT_CALL_WAKE_NAMES
     ):
         words = words[2:]
@@ -797,17 +1002,20 @@ def enqueue_latest_audio(
 
 
 def enqueue_intent(
-    intent_queue: queue.Queue[tuple[str, str]], intent: str, source: str
+    intent_queue: queue.Queue[tuple[str, str, str | None]],
+    intent: str,
+    source: str,
+    data: str | None = None,
 ) -> None:
     try:
-        intent_queue.put_nowait((intent, source))
+        intent_queue.put_nowait((intent, source, data))
     except queue.Full:
         try:
             intent_queue.get_nowait()
         except queue.Empty:
             pass
         try:
-            intent_queue.put_nowait((intent, source))
+            intent_queue.put_nowait((intent, source, data))
         except queue.Full:
             pass
 
@@ -824,9 +1032,24 @@ def append_pre_roll(
         chunks[0] = chunks[0][trim:]
 
 
+def has_explicit_conversation_wake_prefix(text: str) -> bool:
+    words = normalize_command(text)
+    return bool(
+        words
+        and (
+            words[0] in DIRECT_CALL_WAKE_NAMES
+            or (
+                len(words) >= 2
+                and words[0] in {"hey", "hello"}
+                and words[1] in DIRECT_CALL_WAKE_NAMES
+            )
+        )
+    )
+
+
 def process_transcription(
     text: str,
-    intent_queue: queue.Queue[tuple[str, str]],
+    intent_queue: queue.Queue[tuple[str, str, str | None]],
     kws_wake_pending: threading.Event,
 ) -> None:
     normalized_text = normalize_voice_transcription(text)
@@ -840,6 +1063,16 @@ def process_transcription(
             debug("KWS pending wake converted to command")
             kws_wake_pending.clear()
             debug("KWS pending wake cancelled")
+        elif intent is None:
+            if has_explicit_conversation_wake_prefix(normalized_text):
+                intent = INTENT_CONVERSATION
+                source = "kws"
+                kws_wake_pending.clear()
+                debug("KWS pending wake accepted conversation fallback")
+            else:
+                kws_wake_pending.clear()
+                debug("conversation fallback rejected; no explicit wake prefix")
+                return
         else:
             intent = INTENT_DIRECT_CALL
             source = "kws"
@@ -848,9 +1081,17 @@ def process_transcription(
         intent = command_intent(normalized_text)
     if intent is not None:
         debug(f"supported intent detected: {intent}")
-        enqueue_intent(intent_queue, intent, source)
+        if intent == INTENT_CONVERSATION:
+            enqueue_intent(
+                intent_queue,
+                INTENT_CONVERSATION,
+                source,
+                normalized_text,
+            )
+        else:
+            enqueue_intent(intent_queue, intent, source)
     else:
-        debug("voice command rejected")
+        debug("voice command rejected; no KWS wake pending")
 
 
 def speak_while_suppressed(
@@ -1066,6 +1307,7 @@ class AudioRouter:
         detector: DoubleClapDetector,
         audio_queue: queue.Queue[object],
         kws_audio_queue: queue.Queue[object],
+        openwakeword_audio_queue: queue.Queue[object],
         speech_suppressed: threading.Event,
         stop_requested: threading.Event,
         runtime_errors: queue.Queue[BaseException],
@@ -1073,6 +1315,7 @@ class AudioRouter:
         self.detector = detector
         self.audio_queue = audio_queue
         self.kws_audio_queue = kws_audio_queue
+        self.openwakeword_audio_queue = openwakeword_audio_queue
         self.speech_suppressed = speech_suppressed
         self.stop_requested = stop_requested
         self.runtime_errors = runtime_errors
@@ -1094,6 +1337,7 @@ class AudioRouter:
             samples.setflags(write=False)
             enqueue_latest_audio(self.audio_queue, samples)
             enqueue_latest_audio(self.kws_audio_queue, samples)
+            enqueue_latest_audio(self.openwakeword_audio_queue, samples)
         except BaseException as error:
             try:
                 self.runtime_errors.put_nowait(error)
@@ -1183,6 +1427,98 @@ def create_keyword_spotter() -> sherpa_onnx.KeywordSpotter:
     )
 
 
+def create_openwakeword_model() -> object | None:
+    if not OPENWAKEWORD_MODEL_PATH:
+        debug("openWakeWord disabled: model path is not configured")
+        return None
+
+    model_path = Path(OPENWAKEWORD_MODEL_PATH)
+    if not model_path.is_file():
+        debug("openWakeWord disabled: configured model is unavailable")
+        return None
+
+    try:
+        threshold = float(OPENWAKEWORD_THRESHOLD_TEXT)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError
+        from openwakeword.model import Model
+
+        return Model(
+            wakeword_models=[str(model_path)],
+            inference_framework="onnx",
+        )
+    except Exception:
+        debug("openWakeWord disabled: package, ONNX runtime, or model unavailable")
+        return None
+
+
+def cleanup_openwakeword_model(model: object) -> None:
+    for method_name in ("cleanup", "release", "close"):
+        method = getattr(model, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                debug("openWakeWord model cleanup failed")
+            return
+
+
+def openwakeword_worker(
+    model: object,
+    audio_queue: queue.Queue[object],
+    speech_suppressed: threading.Event,
+    stop_requested: threading.Event,
+) -> None:
+    try:
+        threshold = float(OPENWAKEWORD_THRESHOLD_TEXT)
+        resampler = StreamingLinearResampler(
+            SAMPLE_RATE, OPENWAKEWORD_SAMPLE_RATE
+        )
+        pending_audio = np.empty(0, dtype=np.int16)
+        detected = False
+        while not stop_requested.is_set():
+            try:
+                item = audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is STOP_AUDIO:
+                break
+            if speech_suppressed.is_set() or not isinstance(item, np.ndarray):
+                resampler.reset()
+                pending_audio = np.empty(0, dtype=np.int16)
+                detected = False
+                continue
+
+            resampled = resampler.process(item)
+            if resampled.size:
+                pcm = np.clip(resampled, -1.0, 1.0)
+                pcm = np.ascontiguousarray(pcm * 32767.0, dtype=np.int16)
+                pending_audio = np.concatenate((pending_audio, pcm))
+
+            while pending_audio.size >= OPENWAKEWORD_FRAME_SAMPLES:
+                frame = np.ascontiguousarray(
+                    pending_audio[:OPENWAKEWORD_FRAME_SAMPLES],
+                    dtype=np.int16,
+                )
+                pending_audio = pending_audio[OPENWAKEWORD_FRAME_SAMPLES:]
+                prediction = model.predict(frame)
+                scores = (
+                    prediction.values()
+                    if isinstance(prediction, dict)
+                    else ()
+                )
+                score = max((float(value) for value in scores), default=0.0)
+                if score >= threshold and not detected:
+                    debug("openWakeWord wake word detected")
+                    detected = True
+                elif score < threshold:
+                    detected = False
+    except Exception:
+        debug("openWakeWord worker failed; Sherpa KWS remains active")
+    finally:
+        cleanup_openwakeword_model(model)
+
+
 def kws_worker(
     keyword_spotter: sherpa_onnx.KeywordSpotter,
     audio_queue: queue.Queue[object],
@@ -1249,7 +1585,7 @@ def speech_worker(
     vad: sherpa_onnx.VoiceActivityDetector | None,
     command_recognizer: WhisperCommandRecognizer | None,
     audio_queue: queue.Queue[object],
-    intent_queue: queue.Queue[tuple[str, str]],
+    intent_queue: queue.Queue[tuple[str, str, str | None]],
     kws_wake_pending: threading.Event,
     speech_suppressed: threading.Event,
     recognizer_reset_requested: threading.Event,
@@ -1409,7 +1745,25 @@ def stop_kws_worker(
         raise RuntimeError("The local keyword-spotting worker did not stop cleanly")
 
 
+def stop_openwakeword_worker(
+    worker: threading.Thread | None,
+    audio_queue: queue.Queue[object],
+) -> None:
+    drain_audio_queue(audio_queue)
+    if worker is None or worker.ident is None:
+        return
+    try:
+        audio_queue.put_nowait(STOP_AUDIO)
+    except queue.Full:
+        pass
+    worker.join(timeout=3.0)
+    if worker.is_alive():
+        debug("openWakeWord worker did not stop cleanly")
+
+
 def main() -> None:
+    global _kokoro_tts_client
+
     if COMMAND_ASR not in {"whisper", "nemotron"}:
         raise ValueError('COMMAND_ASR must be either "whisper" or "nemotron"')
 
@@ -1425,7 +1779,10 @@ def main() -> None:
     kws_audio_queue: queue.Queue[object] = queue.Queue(
         maxsize=KWS_AUDIO_QUEUE_BLOCKS
     )
-    intent_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=1)
+    openwakeword_audio_queue: queue.Queue[object] = queue.Queue(
+        maxsize=OPENWAKEWORD_AUDIO_QUEUE_BLOCKS
+    )
+    intent_queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue(maxsize=1)
     runtime_errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
 
     recognizer = create_recognizer() if COMMAND_ASR == "nemotron" else None
@@ -1434,6 +1791,8 @@ def main() -> None:
         WhisperCommandRecognizer() if COMMAND_ASR == "whisper" else None
     )
     keyword_spotter = create_keyword_spotter()
+    openwakeword_model = create_openwakeword_model()
+    _kokoro_tts_client = KokoroTTSClient()
     say(greeting_for_current_time())
 
     detector = DoubleClapDetector(work_action_requested)
@@ -1441,6 +1800,7 @@ def main() -> None:
         detector,
         audio_queue,
         kws_audio_queue,
+        openwakeword_audio_queue,
         speech_suppressed,
         stop_requested,
         runtime_errors,
@@ -1476,11 +1836,28 @@ def main() -> None:
         ),
         daemon=True,
     )
+    openwakeword_thread = (
+        threading.Thread(
+            target=openwakeword_worker,
+            name="jarvis-openwakeword-worker",
+            args=(
+                openwakeword_model,
+                openwakeword_audio_queue,
+                speech_suppressed,
+                stop_requested,
+            ),
+            daemon=True,
+        )
+        if openwakeword_model is not None
+        else None
+    )
 
     signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         worker.start()
         kws_thread.start()
+        if openwakeword_thread is not None:
+            openwakeword_thread.start()
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
@@ -1494,8 +1871,19 @@ def main() -> None:
                     actions_launched = True
 
                 try:
-                    intent, source = intent_queue.get(timeout=0.1)
+                    intent, source, data = intent_queue.get(timeout=0.1)
                 except queue.Empty:
+                    continue
+                if intent == INTENT_CONVERSATION:
+                    response = generate_conversation_response(data or "")
+                    if response is not None:
+                        speak_while_suppressed(
+                            response,
+                            audio_queue,
+                            speech_suppressed,
+                            recognizer_reset_requested,
+                            recognizer_reset_complete,
+                        )
                     continue
                 if intent == INTENT_DIRECT_CALL:
                     try:
@@ -1600,10 +1988,19 @@ def main() -> None:
                 stop_kws_worker(kws_thread, kws_audio_queue)
             finally:
                 try:
-                    stop_stay_awake(caffeinate_process)
+                    stop_openwakeword_worker(
+                        openwakeword_thread,
+                        openwakeword_audio_queue,
+                    )
                 finally:
-                    if command_recognizer is not None and not worker.is_alive():
-                        command_recognizer.close()
+                    try:
+                        stop_stay_awake(caffeinate_process)
+                    finally:
+                        if command_recognizer is not None and not worker.is_alive():
+                            command_recognizer.close()
+                        if _kokoro_tts_client is not None:
+                            _kokoro_tts_client.close()
+                            _kokoro_tts_client = None
 
     if not runtime_errors.empty():
         raise RuntimeError("A local audio component stopped unexpectedly") from (
