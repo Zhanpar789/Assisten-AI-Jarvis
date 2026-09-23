@@ -1032,19 +1032,8 @@ def append_pre_roll(
         chunks[0] = chunks[0][trim:]
 
 
-def has_explicit_conversation_wake_prefix(text: str) -> bool:
-    words = normalize_command(text)
-    return bool(
-        words
-        and (
-            words[0] in DIRECT_CALL_WAKE_NAMES
-            or (
-                len(words) >= 2
-                and words[0] in {"hey", "hello"}
-                and words[1] in DIRECT_CALL_WAKE_NAMES
-            )
-        )
-    )
+def has_transcribed_conversation_wake(text: str) -> bool:
+    return any(word in DIRECT_CALL_WAKE_NAMES for word in normalize_command(text))
 
 
 def process_transcription(
@@ -1064,21 +1053,22 @@ def process_transcription(
             kws_wake_pending.clear()
             debug("KWS pending wake cancelled")
         elif intent is None:
-            if has_explicit_conversation_wake_prefix(normalized_text):
-                intent = INTENT_CONVERSATION
-                source = "kws"
-                kws_wake_pending.clear()
-                debug("KWS pending wake accepted conversation fallback")
-            else:
-                kws_wake_pending.clear()
-                debug("conversation fallback rejected; no explicit wake prefix")
-                return
+            # KWS has already acoustically confirmed the wake word, so Whisper
+            # need not reproduce it at a particular position in the sentence.
+            intent = INTENT_CONVERSATION
+            source = "kws"
+            kws_wake_pending.clear()
+            debug("KWS pending wake accepted conversation fallback")
         else:
             intent = INTENT_DIRECT_CALL
             source = "kws"
+            kws_wake_pending.clear()
             debug("KWS standalone wake confirmed")
     else:
         intent = command_intent(normalized_text)
+        if intent is None and has_transcribed_conversation_wake(normalized_text):
+            intent = INTENT_CONVERSATION
+            debug("Whisper wake word accepted conversation fallback")
     if intent is not None:
         debug(f"supported intent detected: {intent}")
         if intent == INTENT_CONVERSATION:
